@@ -1,0 +1,59 @@
+name: Données Dukascopy M1 (bid+ask)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  annee:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      max-parallel: 20
+      matrix:
+        symbole: [XAUUSD, XAGUSD, DOLLARIDXUSD, USA500IDXUSD]
+        annee: [2015, 2016, 2017, 2018, 2019, 2020, 2021, 2022, 2023, 2024, 2025, 2026]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Téléchargement ${{ matrix.symbole }} ${{ matrix.annee }}
+        run: |
+          FIN="--end ${{ matrix.annee }}-12-31"
+          if [ "${{ matrix.annee }}" = "$(date -u +%Y)" ]; then FIN=""; fi
+          # jusqu'à 4 passages : chaque passage ne reprend que les mois manquants
+          for i in 1 2 3 4; do
+            python download_dukascopy.py --only ${{ matrix.symbole }} --start ${{ matrix.annee }}-01-01 $FIN --threads 4 | tee log.txt
+            if grep -q "Terminé" log.txt; then exit 0; fi
+            sleep 60
+          done
+          echo "::error::${{ matrix.symbole }} ${{ matrix.annee }} incomplet"
+          exit 1
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.symbole }}_${{ matrix.annee }}
+          path: data/raw/${{ matrix.symbole }}/${{ matrix.symbole }}_${{ matrix.annee }}.csv.gz
+          retention-days: 3
+
+  regroupement:
+    needs: annee
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: raw
+      - name: Rangement par symbole
+        run: |
+          mkdir -p out
+          for d in raw/*/; do
+            n=$(basename "$d"); s=${n%_*}
+            mkdir -p "out/$s"; mv "$d"*.csv.gz "out/$s/"
+          done
+          find out -type f | sort
+      - uses: actions/upload-artifact@v4
+        with:
+          name: donnees-dukascopy
+          path: out
+          retention-days: 7
