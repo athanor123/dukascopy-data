@@ -9,6 +9,9 @@ Usage :
     python historique_scanner.py                          # les 16 actifs
     python historique_scanner.py --start 2024-01-01       # date de départ si aucun fichier n'existe encore
 
+Version 2 (15/10/2026) : téléchargement par tranches de 30 jours, enregistrement après chaque tranche,
+journal de progression, samedis ignorés (sauf BTC), arrêt propre avec --max-minutes.
+
 Sortie (incrémentale : reprend après la dernière bougie déjà enregistrée) :
     historique/<EXCHANGE>_<TICKER>_1h.csv.gz   colonnes t,o,h,l,c  (t = début de bougie, unix UTC)
     historique/<EXCHANGE>_<TICKER>_15m.csv.gz
@@ -59,8 +62,12 @@ class FetchError(RuntimeError):
     pass
 
 
+ERRORS = {"n": 0}
+
+
 def fetch(url, retries=8):
-    """Dukascopy limite le débit : nouvelles tentatives avec attente croissante (2, 4, 8 … 60 s)."""
+    """Dukascopy limite le débit : nouvelles tentatives avec attente croissante (2, 4, 8 … 60 s).
+    Les premières erreurs sont affichées dans le log (code HTTP ou message) pour diagnostiquer un blocage."""
     for k in range(retries):
         try:
             req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
@@ -69,8 +76,12 @@ def fetch(url, retries=8):
         except urllib.error.HTTPError as e:
             if e.code == 404:
                 return b""
-        except Exception:
-            pass
+            err = f"HTTP {e.code}"
+        except Exception as e:
+            err = f"{type(e).__name__}: {e}"
+        ERRORS["n"] += 1
+        if ERRORS["n"] <= 20 or ERRORS["n"] % 100 == 0:
+            print(f"   ⚠️ erreur n°{ERRORS['n']} ({err}) sur {url.split('/datafeed/')[-1]} — nouvel essai", flush=True)
         time.sleep(min(2 ** (k + 1), 60))
     raise FetchError(url)
 
@@ -150,8 +161,12 @@ def save_csv(path, bars):
     os.replace(tmp, path)
 
 
-def update_symbol(sym, start, end, out_dir, threads):
+def update_symbol(sym, start, end, out_dir, threads, deadline, chunk_days=30):
+    """Télécharge par tranches de `chunk_days` jours et ENREGISTRE après chaque tranche :
+    si le temps manque ou si Dukascopy bloque, tout ce qui est déjà téléchargé est gardé
+    et le passage suivant reprend là où on s'est arrêté."""
     dsym, rng = INSTRUMENTS[sym]
+    crypto = sym.startswith("COINBASE:")
     base = sym.replace(":", "_")
     paths = {tf: os.path.join(out_dir, f"{base}_{tf}.csv.gz") for tf in FRAMES}
     existing = {tf: load_csv(p) for tf, p in paths.items()}
@@ -159,48 +174,73 @@ def update_symbol(sym, start, end, out_dir, threads):
     last = min((existing[tf][-1][0] for tf in FRAMES if existing[tf]), default=None)
     first_day = dt.datetime.fromtimestamp(last, dt.timezone.utc).date() if last else start
     days = [first_day + dt.timedelta(n) for n in range((end - first_day).days + 1)]
+    if not crypto:
+        days = [d for d in days if d.weekday() != 5]   # samedi : marché fermé (sauf crypto)
+    if not days:
+        print(f"{sym} : déjà à jour", flush=True)
+        return True
+    print(f"{sym} : {len(days)} jours à télécharger, du {days[0]} au {days[-1]}"
+          f" (déjà enregistré : {len(existing['1h'])} bougies H1)", flush=True)
     div_box = [None]
     # diviseur : déterminé sur un jour de semaine récent, avant le téléchargement parallèle
-    for d in reversed(days):
-        if d.weekday() < 5:
-            try:
-                if day_minutes(dsym, d, rng, div_box) and div_box[0]:
-                    break
-            except FetchError:
-                pass
+    t_test = time.time()
+    for d in [x for x in reversed(days) if x.weekday() < 5][:5]:   # 5 jours de semaine récents au plus
+        try:
+            if day_minutes(dsym, d, rng, div_box) and div_box[0]:
+                break
+        except FetchError:
+            pass
     if div_box[0] is None:
-        print(f"{sym} : impossible de déterminer le diviseur de prix — actif ignoré", flush=True)
+        print(f"{sym} : impossible de lire les données Dukascopy (5 jours testés, {time.time() - t_test:.0f} s)"
+              " — Dukascopy bloque ou ne répond pas, actif ignoré", flush=True)
         return False
+    print(f"{sym} : connexion OK, diviseur {div_box[0]} ({time.time() - t_test:.1f} s pour le test)", flush=True)
 
     def safe(d):
+        if time.time() > deadline:
+            return None
         try:
             return day_minutes(dsym, d, rng, div_box)
         except FetchError:
             return None
 
+    t_start = time.time()
+    done = 0
     with ThreadPoolExecutor(threads) as ex:
-        results = list(ex.map(safe, days))
-    for i, d in enumerate(days):           # jours en échec : nouvel essai, un par un
-        if results[i] is None:
-            time.sleep(10)
-            results[i] = safe(d)
-    failed = [d.isoformat() for d, r in zip(days, results) if r is None]
-    if failed:
-        # on n'enregistre que jusqu'au premier jour manquant, pour ne jamais laisser de trou au milieu
-        cut = days[[r is None for r in results].index(True)]
-        results = [r for d, r in zip(days, results) if d < cut]
-        print(f"{sym} : {len(failed)} jour(s) en échec à partir du {failed[0]} — relancer plus tard", flush=True)
-    minutes = sorted(m for r in results for m in r)
-    if not minutes:
-        print(f"{sym} : aucune nouvelle bougie", flush=True)
-        return not failed
-    t0 = minutes[0][0]
-    for tf, step in FRAMES.items():
-        new = resample(minutes, step)
-        kept = [b for b in existing[tf] if b[0] < t0 - t0 % step]
-        save_csv(paths[tf], kept + new)
-        print(f"{sym} {tf} : {len(kept)} + {len(new)} bougies (diviseur {div_box[0]})", flush=True)
-    return not failed
+        for c0 in range(0, len(days), chunk_days):
+            if time.time() > deadline:
+                print(f"{sym} : temps écoulé — arrêt propre au {days[c0]} ({done}/{len(days)} jours)."
+                      " Le prochain passage reprendra ici.", flush=True)
+                return False
+            chunk = days[c0:c0 + chunk_days]
+            results = list(ex.map(safe, chunk))
+            n_fail = sum(r is None for r in results)
+            for i, d in enumerate(chunk):          # quelques jours en échec : nouvel essai, un par un
+                if results[i] is None and n_fail <= 5 and time.time() < deadline:
+                    time.sleep(10)
+                    results[i] = safe(d)
+            failed = [d for d, r in zip(chunk, results) if r is None]
+            if failed:
+                # on n'enregistre que jusqu'au premier jour manquant, pour ne jamais laisser de trou au milieu
+                results = [r for d, r in zip(chunk, results) if d < failed[0]]
+            minutes = sorted(m for r in results for m in r)
+            if minutes:
+                t0 = minutes[0][0]
+                for tf, step in FRAMES.items():
+                    new = resample(minutes, step)
+                    existing[tf] = [b for b in existing[tf] if b[0] < t0 - t0 % step] + new
+                    save_csv(paths[tf], existing[tf])
+            done += len(chunk) if not failed else chunk.index(failed[0])
+            el = (time.time() - t_start) / 60
+            print(f"{sym} : {chunk[-1] if not failed else failed[0]} — {done}/{len(days)} jours"
+                  f" • {len(existing['1h'])} bougies H1 • {el:.0f} min", flush=True)
+            if failed:
+                print(f"{sym} : {len(failed)} jour(s) en échec à partir du {failed[0]} — "
+                      "enregistré jusqu'à la veille, relancer plus tard", flush=True)
+                return False
+    print(f"{sym} : terminé ({len(existing['1h'])} bougies H1, {len(existing['15m'])} bougies M15,"
+          f" diviseur {div_box[0]})", flush=True)
+    return True
 
 
 def main():
@@ -210,7 +250,10 @@ def main():
     ap.add_argument("--only", nargs="*", default=None, help="ex : XAUUSD EURUSD (sans préfixe)")
     ap.add_argument("--threads", type=int, default=4)
     ap.add_argument("--out", default="historique")
+    ap.add_argument("--max-minutes", type=float, default=0,
+                    help="arrêt propre (avec sauvegarde) après N minutes ; 0 = pas de limite")
     a = ap.parse_args()
+    deadline = time.time() + a.max_minutes * 60 if a.max_minutes else float("inf")
     os.makedirs(a.out, exist_ok=True)
     syms = list(INSTRUMENTS)
     if a.only:
@@ -218,7 +261,7 @@ def main():
         syms = [s for s in syms if s.split(":")[1] in wanted]
     ok = True
     for s in syms:
-        ok &= update_symbol(s, dt.date.fromisoformat(a.start), dt.date.fromisoformat(a.end), a.out, a.threads)
+        ok &= update_symbol(s, dt.date.fromisoformat(a.start), dt.date.fromisoformat(a.end), a.out, a.threads, deadline)
     print("Terminé." if ok else "INCOMPLET : relancer pour compléter.")
     return 0 if ok else 1
 
