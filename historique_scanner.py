@@ -9,6 +9,7 @@ Usage :
     python historique_scanner.py                          # les 16 actifs
     python historique_scanner.py --start 2024-01-01       # date de départ si aucun fichier n'existe encore
 
+Version 2.2 (15/10/2026) : 8 paires de devises en plus, option --suffix (historique ancien dans des fichiers séparés).\nVersion 2.1 (15/10/2026) : diviseur BTC corrigé (prix ×10) avec remise à l'échelle automatique des fichiers existants.
 Version 2 (15/10/2026) : téléchargement par tranches de 30 jours, enregistrement après chaque tranche,
 journal de progression, samedis ignorés (sauf BTC), arrêt propre avec --max-minutes.
 
@@ -53,7 +54,16 @@ INSTRUMENTS = {
     "OANDA:SPX500USD": ("USA500IDXUSD",  (1000.0, 15000.0)),
     "OANDA:US30USD":   ("USA30IDXUSD",   (10000.0, 90000.0)),
     "OANDA:DE30EUR":   ("DEUIDXEUR",     (5000.0, 50000.0)),
-    "COINBASE:BTCUSD": ("BTCUSD",        (1000.0, 1000000.0)),
+    "COINBASE:BTCUSD": ("BTCUSD",        (5000.0, 500000.0)),   # v2.1 : (1000, 1e6) prenait le mauvais diviseur (prix ×10)
+    # v2.2 : paires de devises supplémentaires (test H4 sur des données neuves)
+    "OANDA:NZDUSD":    ("NZDUSD",        (0.4, 1.0)),
+    "OANDA:EURGBP":    ("EURGBP",        (0.6, 1.1)),
+    "OANDA:AUDJPY":    ("AUDJPY",        (50.0, 130.0)),
+    "OANDA:CADJPY":    ("CADJPY",        (60.0, 140.0)),
+    "OANDA:EURAUD":    ("EURAUD",        (1.2, 2.2)),
+    "OANDA:GBPCHF":    ("GBPCHF",        (0.9, 1.6)),
+    "OANDA:EURCHF":    ("EURCHF",        (0.8, 1.3)),
+    "OANDA:AUDCAD":    ("AUDCAD",        (0.7, 1.1)),
 }
 FRAMES = {"1h": 3600, "15m": 900}
 
@@ -161,13 +171,13 @@ def save_csv(path, bars):
     os.replace(tmp, path)
 
 
-def update_symbol(sym, start, end, out_dir, threads, deadline, chunk_days=30):
+def update_symbol(sym, start, end, out_dir, threads, deadline, chunk_days=30, suffix=""):
     """Télécharge par tranches de `chunk_days` jours et ENREGISTRE après chaque tranche :
     si le temps manque ou si Dukascopy bloque, tout ce qui est déjà téléchargé est gardé
     et le passage suivant reprend là où on s'est arrêté."""
     dsym, rng = INSTRUMENTS[sym]
     crypto = sym.startswith("COINBASE:")
-    base = sym.replace(":", "_")
+    base = sym.replace(":", "_") + suffix
     paths = {tf: os.path.join(out_dir, f"{base}_{tf}.csv.gz") for tf in FRAMES}
     existing = {tf: load_csv(p) for tf, p in paths.items()}
     # reprise : on recommence au début du dernier jour déjà présent (la dernière journée peut être incomplète)
@@ -184,9 +194,11 @@ def update_symbol(sym, start, end, out_dir, threads, deadline, chunk_days=30):
     div_box = [None]
     # diviseur : déterminé sur un jour de semaine récent, avant le téléchargement parallèle
     t_test = time.time()
+    probe = None
     for d in [x for x in reversed(days) if x.weekday() < 5][:5]:   # 5 jours de semaine récents au plus
         try:
-            if day_minutes(dsym, d, rng, div_box) and div_box[0]:
+            probe = day_minutes(dsym, d, rng, div_box)
+            if probe and div_box[0]:
                 break
         except FetchError:
             pass
@@ -195,6 +207,16 @@ def update_symbol(sym, start, end, out_dir, threads, deadline, chunk_days=30):
               " — Dukascopy bloque ou ne répond pas, actif ignoré", flush=True)
         return False
     print(f"{sym} : connexion OK, diviseur {div_box[0]} ({time.time() - t_test:.1f} s pour le test)", flush=True)
+    # fichiers enregistrés avec un mauvais diviseur (ex. BTC ×10 avant la v2.1) : remise à l'échelle automatique
+    if existing["1h"] and probe:
+        ratio = existing["1h"][-1][4] / probe[-1][4]
+        for k in (1, 2, 3, 4):
+            for f in (10 ** k, 10 ** -k):
+                if abs(ratio / f - 1) < 0.25:
+                    print(f"{sym} : prix déjà enregistrés {f:g} fois trop grands — remise à l'échelle", flush=True)
+                    for tf in FRAMES:
+                        existing[tf] = [[b[0]] + [v / f for v in b[1:]] for b in existing[tf]]
+                        save_csv(paths[tf], existing[tf])
 
     def safe(d):
         if time.time() > deadline:
@@ -250,6 +272,7 @@ def main():
     ap.add_argument("--only", nargs="*", default=None, help="ex : XAUUSD EURUSD (sans préfixe)")
     ap.add_argument("--threads", type=int, default=4)
     ap.add_argument("--out", default="historique")
+    ap.add_argument("--suffix", default="", help="ajouté au nom des fichiers, ex : _2019-2023")
     ap.add_argument("--max-minutes", type=float, default=0,
                     help="arrêt propre (avec sauvegarde) après N minutes ; 0 = pas de limite")
     a = ap.parse_args()
@@ -261,7 +284,7 @@ def main():
         syms = [s for s in syms if s.split(":")[1] in wanted]
     ok = True
     for s in syms:
-        ok &= update_symbol(s, dt.date.fromisoformat(a.start), dt.date.fromisoformat(a.end), a.out, a.threads, deadline)
+        ok &= update_symbol(s, dt.date.fromisoformat(a.start), dt.date.fromisoformat(a.end), a.out, a.threads, deadline, suffix=a.suffix)
     print("Terminé." if ok else "INCOMPLET : relancer pour compléter.")
     return 0 if ok else 1
 
