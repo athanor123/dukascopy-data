@@ -2,13 +2,15 @@ name: Historique scanner Gold'n'Eye (H1 + M15, 16 actifs)
 
 # À placer dans le dépôt : .github/workflows/historique-scanner.yml
 # Le script historique_scanner.py doit être à la racine du dépôt.
+# Version 2 (15/10/2026) : enregistrement par tranches de 30 jours, progression visible dans le log,
+# reprise automatique toutes les 6 h tant que l'historique n'est pas complet.
 # 1er lancement : Actions → « Historique scanner Gold'n'Eye » → Run workflow (télécharge depuis le 01/01/2024).
-# Ensuite : mise à jour automatique chaque soir de semaine à 22:30 UTC (seules les nouvelles journées).
+# Ensuite : mise à jour automatique toutes les 6 h (seules les nouvelles journées).
 
 on:
   workflow_dispatch:
   schedule:
-    - cron: "30 22 * * 1-5"
+    - cron: "30 */6 * * *"   # toutes les 6 h : rattrape tout seul un téléchargement incomplet, puis simple mise à jour
 
 permissions:
   contents: write
@@ -23,7 +25,7 @@ jobs:
     timeout-minutes: 300
     strategy:
       fail-fast: false
-      max-parallel: 8
+      max-parallel: 16
       matrix:
         include:
           - { ticker: XAUUSD,    base: OANDA_XAUUSD }
@@ -49,14 +51,12 @@ jobs:
           python-version: "3.12"
       - name: Téléchargement ${{ matrix.ticker }}
         run: |
-          # jusqu'à 4 passages : chaque passage reprend après la dernière bougie enregistrée
-          for i in 1 2 3 4; do
-            python historique_scanner.py --only ${{ matrix.ticker }} --start 2024-01-01 --out historique --threads 4 | tee log.txt
-            if grep -q "Terminé" log.txt; then break; fi
-            sleep 60
-          done
+          # arrêt propre après 270 min (le job est coupé à 300) : tout ce qui est téléchargé est enregistré,
+          # le passage suivant reprend après la dernière bougie
+          python historique_scanner.py --only ${{ matrix.ticker }} --start 2024-01-01 --out historique --threads 4 --max-minutes 270 || true
           ls -la historique/ | grep ${{ matrix.base }} || true
       - uses: actions/upload-artifact@v4
+        if: always()
         with:
           name: ${{ matrix.base }}
           path: historique/${{ matrix.base }}_*.csv.gz
