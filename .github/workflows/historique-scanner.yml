@@ -2,6 +2,7 @@ name: Historique scanner Gold'n'Eye (H1 + M15, 16 actifs)
 
 # À placer dans le dépôt : .github/workflows/historique-scanner.yml
 # Le script historique_scanner.py doit être à la racine du dépôt.
+# Version 2.2 (15/10/2026) : 8 paires en plus depuis 2019 + 2019-2023 des 8 paires suivies.
 # Version 2 (15/10/2026) : enregistrement par tranches de 30 jours, progression visible dans le log,
 # reprise automatique toutes les 6 h tant que l'historique n'est pas complet.
 # 1er lancement : Actions → « Historique scanner Gold'n'Eye » → Run workflow (télécharge depuis le 01/01/2024).
@@ -25,9 +26,10 @@ jobs:
     timeout-minutes: 300
     strategy:
       fail-fast: false
-      max-parallel: 16
+      max-parallel: 32
       matrix:
         include:
+          # ---- 16 actifs du scanner, depuis 2024
           - { ticker: XAUUSD,    base: OANDA_XAUUSD }
           - { ticker: XAGUSD,    base: OANDA_XAGUSD }
           - { ticker: WTICOUSD,  base: OANDA_WTICOUSD }
@@ -44,6 +46,24 @@ jobs:
           - { ticker: US30USD,   base: OANDA_US30USD }
           - { ticker: DE30EUR,   base: OANDA_DE30EUR }
           - { ticker: BTCUSD,    base: COINBASE_BTCUSD }
+          # ---- v2.2 : 8 nouvelles paires, depuis 2019 (test H4 sur données neuves)
+          - { ticker: NZDUSD,    base: OANDA_NZDUSD, start: "2019-01-01" }
+          - { ticker: EURGBP,    base: OANDA_EURGBP, start: "2019-01-01" }
+          - { ticker: AUDJPY,    base: OANDA_AUDJPY, start: "2019-01-01" }
+          - { ticker: CADJPY,    base: OANDA_CADJPY, start: "2019-01-01" }
+          - { ticker: EURAUD,    base: OANDA_EURAUD, start: "2019-01-01" }
+          - { ticker: GBPCHF,    base: OANDA_GBPCHF, start: "2019-01-01" }
+          - { ticker: EURCHF,    base: OANDA_EURCHF, start: "2019-01-01" }
+          - { ticker: AUDCAD,    base: OANDA_AUDCAD, start: "2019-01-01" }
+          # ---- v2.2 : 2019-2023 des 8 paires déjà suivies (fichiers séparés *_2019-2023_*)
+          - { ticker: EURUSD, base: OANDA_EURUSD_2019-2023, start: "2019-01-01", end: "2023-12-31", suffix: "_2019-2023" }
+          - { ticker: GBPUSD, base: OANDA_GBPUSD_2019-2023, start: "2019-01-01", end: "2023-12-31", suffix: "_2019-2023" }
+          - { ticker: USDJPY, base: OANDA_USDJPY_2019-2023, start: "2019-01-01", end: "2023-12-31", suffix: "_2019-2023" }
+          - { ticker: AUDUSD, base: OANDA_AUDUSD_2019-2023, start: "2019-01-01", end: "2023-12-31", suffix: "_2019-2023" }
+          - { ticker: USDCAD, base: OANDA_USDCAD_2019-2023, start: "2019-01-01", end: "2023-12-31", suffix: "_2019-2023" }
+          - { ticker: USDCHF, base: OANDA_USDCHF_2019-2023, start: "2019-01-01", end: "2023-12-31", suffix: "_2019-2023" }
+          - { ticker: GBPJPY, base: OANDA_GBPJPY_2019-2023, start: "2019-01-01", end: "2023-12-31", suffix: "_2019-2023" }
+          - { ticker: EURJPY, base: OANDA_EURJPY_2019-2023, start: "2019-01-01", end: "2023-12-31", suffix: "_2019-2023" }
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -53,13 +73,15 @@ jobs:
         run: |
           # arrêt propre après 270 min (le job est coupé à 300) : tout ce qui est téléchargé est enregistré,
           # le passage suivant reprend après la dernière bougie
-          python historique_scanner.py --only ${{ matrix.ticker }} --start 2024-01-01 --out historique --threads 4 --max-minutes 270 || true
+          python historique_scanner.py --only ${{ matrix.ticker }} --start ${{ matrix.start || '2024-01-01' }} ${{ matrix.end && format('--end {0}', matrix.end) || '' }} --suffix "${{ matrix.suffix }}" --out historique --threads 4 --max-minutes 270 || true
           ls -la historique/ | grep ${{ matrix.base }} || true
       - uses: actions/upload-artifact@v4
         if: always()
         with:
           name: ${{ matrix.base }}
-          path: historique/${{ matrix.base }}_*.csv.gz
+          path: |
+            historique/${{ matrix.base }}_1h.csv.gz
+            historique/${{ matrix.base }}_15m.csv.gz
           if-no-files-found: warn
           retention-days: 2
 
@@ -82,4 +104,6 @@ jobs:
           git add historique/*.csv.gz
           if git diff --cached --quiet; then echo "Rien de nouveau."; exit 0; fi
           git commit -m "Historique scanner : mise à jour du $(date -u +%Y-%m-%d)"
-          git push
+          # si le dépôt a été modifié pendant le téléchargement, on se remet à jour avant d'envoyer
+          for i in 1 2 3; do git pull --rebase -X theirs origin main && git push && exit 0; sleep 10; done
+          exit 1
